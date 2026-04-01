@@ -1,96 +1,228 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+import time
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from .models import PortingBacklog, PortingModule
-from .permissions import ToolPermissionContext
-
-SNAPSHOT_PATH = Path(__file__).resolve().parent / 'reference_data' / 'tools_snapshot.json'
+from .permissions import PermissionMode, PermissionPolicy
 
 
 @dataclass(frozen=True)
-class ToolExecution:
+class ToolSpec:
     name: str
-    source_hint: str
-    payload: str
+    description: str
+    input_schema: dict[str, Any]
+    required_permission: PermissionMode
+
+
+@dataclass
+class ToolExecutionContext:
+    cwd: Path
+    permission_policy: PermissionPolicy
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    name: str
     handled: bool
-    message: str
+    output: str
 
 
-@lru_cache(maxsize=1)
-def load_tool_snapshot() -> tuple[PortingModule, ...]:
-    raw_entries = json.loads(SNAPSHOT_PATH.read_text())
-    return tuple(
-        PortingModule(
-            name=entry['name'],
-            responsibility=entry['responsibility'],
-            source_hint=entry['source_hint'],
-            status='mirrored',
-        )
-        for entry in raw_entries
+def mvp_tool_specs() -> tuple[ToolSpec, ...]:
+    return (
+        ToolSpec('bash', 'Execute a shell command in the current workspace.', {'required': ['command']}, PermissionMode.DANGER_FULL_ACCESS),
+        ToolSpec('read_file', 'Read a text file from the workspace.', {'required': ['path']}, PermissionMode.READ_ONLY),
+        ToolSpec('write_file', 'Write a text file in the workspace.', {'required': ['path', 'content']}, PermissionMode.WORKSPACE_WRITE),
+        ToolSpec('edit_file', 'Replace text in a workspace file.', {'required': ['path', 'old_string', 'new_string']}, PermissionMode.WORKSPACE_WRITE),
+        ToolSpec('glob_search', 'Find files by glob pattern.', {'required': ['pattern']}, PermissionMode.READ_ONLY),
+        ToolSpec('grep_search', 'Search file contents with a regex pattern.', {'required': ['pattern']}, PermissionMode.READ_ONLY),
+        ToolSpec('WebFetch', 'Fetch a URL and summarize it.', {'required': ['url', 'prompt']}, PermissionMode.READ_ONLY),
+        ToolSpec('WebSearch', 'Search the web for current information.', {'required': ['query']}, PermissionMode.READ_ONLY),
+        ToolSpec('TodoWrite', 'Update the structured task list for the current session.', {'required': ['todos']}, PermissionMode.WORKSPACE_WRITE),
+        ToolSpec('Skill', 'Load a local skill definition and its instructions.', {'required': ['skill']}, PermissionMode.READ_ONLY),
+        ToolSpec('Agent', 'Launch a specialized agent task.', {'required': ['description', 'prompt']}, PermissionMode.DANGER_FULL_ACCESS),
+        ToolSpec('ToolSearch', 'Search for supported tools by name or keyword.', {'required': ['query']}, PermissionMode.READ_ONLY),
+        ToolSpec('NotebookEdit', 'Replace, insert, or delete a cell in a Jupyter notebook.', {'required': ['notebook_path']}, PermissionMode.WORKSPACE_WRITE),
+        ToolSpec('Sleep', 'Wait for a specified duration.', {'required': ['duration_ms']}, PermissionMode.READ_ONLY),
+        ToolSpec('SendUserMessage', 'Send a message to the user.', {'required': ['message', 'status']}, PermissionMode.READ_ONLY),
     )
 
 
-PORTED_TOOLS = load_tool_snapshot()
+def tool_specs_by_name() -> dict[str, ToolSpec]:
+    return {spec.name: spec for spec in mvp_tool_specs()}
 
 
-def build_tool_backlog() -> PortingBacklog:
-    return PortingBacklog(title='Tool surface', modules=list(PORTED_TOOLS))
-
-
-def tool_names() -> list[str]:
-    return [module.name for module in PORTED_TOOLS]
-
-
-def get_tool(name: str) -> PortingModule | None:
-    needle = name.lower()
-    for module in PORTED_TOOLS:
-        if module.name.lower() == needle:
-            return module
-    return None
-
-
-def filter_tools_by_permission_context(tools: tuple[PortingModule, ...], permission_context: ToolPermissionContext | None = None) -> tuple[PortingModule, ...]:
-    if permission_context is None:
-        return tools
-    return tuple(module for module in tools if not permission_context.blocks(module.name))
-
-
-def get_tools(
-    simple_mode: bool = False,
-    include_mcp: bool = True,
-    permission_context: ToolPermissionContext | None = None,
-) -> tuple[PortingModule, ...]:
-    tools = list(PORTED_TOOLS)
-    if simple_mode:
-        tools = [module for module in tools if module.name in {'BashTool', 'FileReadTool', 'FileEditTool'}]
-    if not include_mcp:
-        tools = [module for module in tools if 'mcp' not in module.name.lower() and 'mcp' not in module.source_hint.lower()]
-    return filter_tools_by_permission_context(tuple(tools), permission_context)
-
-
-def find_tools(query: str, limit: int = 20) -> list[PortingModule]:
+def tool_search(query: str, max_results: int = 10) -> list[ToolSpec]:
     needle = query.lower()
-    matches = [module for module in PORTED_TOOLS if needle in module.name.lower() or needle in module.source_hint.lower()]
-    return matches[:limit]
+    ranked = [
+        spec
+        for spec in mvp_tool_specs()
+        if needle in spec.name.lower() or needle in spec.description.lower()
+    ]
+    return ranked[:max_results]
 
 
-def execute_tool(name: str, payload: str = '') -> ToolExecution:
-    module = get_tool(name)
-    if module is None:
-        return ToolExecution(name=name, source_hint='', payload=payload, handled=False, message=f'Unknown mirrored tool: {name}')
-    action = f"Mirrored tool '{module.name}' from {module.source_hint} would handle payload {payload!r}."
-    return ToolExecution(name=module.name, source_hint=module.source_hint, payload=payload, handled=True, message=action)
+def execute_tool(name: str, payload: str | dict[str, Any], context: ToolExecutionContext) -> ToolExecutionResult:
+    spec = tool_specs_by_name().get(name)
+    if spec is None:
+        return ToolExecutionResult(name=name, handled=False, output=f'Unknown tool: {name}')
+    payload_data = payload if isinstance(payload, dict) else json.loads(payload or '{}')
+    decision = context.permission_policy.authorize(name, json.dumps(payload_data, ensure_ascii=True))
+    if not decision.allowed:
+        return ToolExecutionResult(name=name, handled=False, output=decision.reason)
+    handlers = {
+        'bash': _exec_bash,
+        'read_file': _read_file,
+        'write_file': _write_file,
+        'edit_file': _edit_file,
+        'glob_search': _glob_search,
+        'grep_search': _grep_search,
+        'TodoWrite': _todo_write,
+        'Skill': _skill_read,
+        'ToolSearch': _tool_search_exec,
+        'Sleep': _sleep_exec,
+        'SendUserMessage': _send_user_message,
+        'WebFetch': _unsupported_network_tool,
+        'WebSearch': _unsupported_network_tool,
+        'Agent': _agent_stub,
+        'NotebookEdit': _notebook_stub,
+    }
+    output = handlers[name](payload_data, context)
+    return ToolExecutionResult(name=name, handled=True, output=output)
 
 
-def render_tool_index(limit: int = 20, query: str | None = None) -> str:
-    modules = find_tools(query, limit) if query else list(PORTED_TOOLS[:limit])
-    lines = [f'Tool entries: {len(PORTED_TOOLS)}', '']
-    if query:
-        lines.append(f'Filtered by: {query}')
-        lines.append('')
-    lines.extend(f'- {module.name} — {module.source_hint}' for module in modules)
-    return '\n'.join(lines)
+def _resolve_workspace_path(context: ToolExecutionContext, raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = context.cwd / path
+    return path.resolve()
+
+
+def _exec_bash(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    completed = subprocess.run(
+        payload['command'],
+        cwd=context.cwd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=int(payload.get('timeout', 30)),
+    )
+    return '\n'.join(
+        [
+            f'exit_code={completed.returncode}',
+            completed.stdout.rstrip(),
+            completed.stderr.rstrip(),
+        ]
+    ).strip()
+
+
+def _read_file(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    path = _resolve_workspace_path(context, payload['path'])
+    lines = path.read_text(encoding='utf-8').splitlines()
+    offset = int(payload.get('offset', 0))
+    limit = int(payload.get('limit', max(1, len(lines) - offset or 1)))
+    window = lines[offset : offset + limit]
+    return '\n'.join(window)
+
+
+def _write_file(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    path = _resolve_workspace_path(context, payload['path'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload['content'], encoding='utf-8')
+    return f'wrote {path}'
+
+
+def _edit_file(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    path = _resolve_workspace_path(context, payload['path'])
+    text = path.read_text(encoding='utf-8')
+    old_string = payload['old_string']
+    new_string = payload['new_string']
+    replace_all = bool(payload.get('replace_all', False))
+    if old_string not in text:
+        return f'pattern not found in {path}'
+    updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+    path.write_text(updated, encoding='utf-8')
+    return f'edited {path}'
+
+
+def _glob_search(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    root = _resolve_workspace_path(context, payload.get('path', '.'))
+    matches = sorted(path for path in root.glob(payload['pattern']))
+    return '\n'.join(str(path.relative_to(context.cwd)) for path in matches[:200])
+
+
+def _grep_search(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    pattern = re.compile(payload['pattern'], re.IGNORECASE if payload.get('-i') else 0)
+    root = _resolve_workspace_path(context, payload.get('path', '.'))
+    glob_pattern = payload.get('glob', '**/*')
+    results: list[str] = []
+    head_limit = int(payload.get('head_limit', 50))
+    for path in root.glob(glob_pattern):
+        if not path.is_file():
+            continue
+        try:
+            for line_number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
+                if pattern.search(line):
+                    results.append(f'{path.relative_to(context.cwd)}:{line_number}:{line}')
+                    if len(results) >= head_limit:
+                        return '\n'.join(results)
+        except UnicodeDecodeError:
+            continue
+    return '\n'.join(results)
+
+
+def _todo_write(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    path = context.cwd / '.claw' / 'todos.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload['todos'], indent=2), encoding='utf-8')
+    return f'wrote {path}'
+
+
+def _skill_read(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    skill = payload['skill']
+    candidate_paths = [
+        Path(skill),
+        context.cwd / skill,
+        Path.home() / '.codex' / 'skills' / skill / 'SKILL.md',
+    ]
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate.read_text(encoding='utf-8')
+    return f'skill not found: {skill}'
+
+
+def _tool_search_exec(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del context
+    matches = tool_search(payload['query'], int(payload.get('max_results', 10)))
+    return '\n'.join(f'{spec.name}: {spec.description}' for spec in matches)
+
+
+def _sleep_exec(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del context
+    duration_ms = max(0, min(int(payload['duration_ms']), 2000))
+    time.sleep(duration_ms / 1000)
+    return f'slept {duration_ms}ms'
+
+
+def _send_user_message(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del context
+    return f"[{payload['status']}] {payload['message']}"
+
+
+def _unsupported_network_tool(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del payload, context
+    return 'network-backed tool is not implemented in the offline Python port yet'
+
+
+def _agent_stub(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del context
+    return f"queued agent task: {payload['description']}"
+
+
+def _notebook_stub(payload: dict[str, Any], context: ToolExecutionContext) -> str:
+    del context
+    return f"NotebookEdit is not implemented yet for {payload['notebook_path']}"

@@ -1,90 +1,61 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
-
-from .models import PortingBacklog, PortingModule
-
-SNAPSHOT_PATH = Path(__file__).resolve().parent / 'reference_data' / 'commands_snapshot.json'
 
 
 @dataclass(frozen=True)
-class CommandExecution:
+class SlashCommandSpec:
     name: str
-    source_hint: str
-    prompt: str
-    handled: bool
-    message: str
+    summary: str
+    argument_hint: str | None = None
+    resume_supported: bool = True
 
 
-@lru_cache(maxsize=1)
-def load_command_snapshot() -> tuple[PortingModule, ...]:
-    raw_entries = json.loads(SNAPSHOT_PATH.read_text())
-    return tuple(
-        PortingModule(
-            name=entry['name'],
-            responsibility=entry['responsibility'],
-            source_hint=entry['source_hint'],
-            status='mirrored',
-        )
-        for entry in raw_entries
-    )
+SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec('help', 'Show available slash commands'),
+    SlashCommandSpec('status', 'Show current session status'),
+    SlashCommandSpec('compact', 'Compact local session history'),
+    SlashCommandSpec('model', 'Show or switch the active model', '[model]', False),
+    SlashCommandSpec('permissions', 'Show or switch the active permission mode', '[read-only|workspace-write|danger-full-access]', False),
+    SlashCommandSpec('clear', 'Start a fresh local session', '[--confirm]'),
+    SlashCommandSpec('cost', 'Show cumulative token usage for this session'),
+    SlashCommandSpec('resume', 'Load a saved session into the REPL', '<session-path>', False),
+    SlashCommandSpec('config', 'Inspect runtime config', '[env|model|session]'),
+    SlashCommandSpec('memory', 'Inspect CLAUDE.md contents'),
+    SlashCommandSpec('init', 'Create a starter CLAUDE.md for this repo'),
+    SlashCommandSpec('diff', 'Show git diff for current workspace changes'),
+    SlashCommandSpec('version', 'Show CLI version and build information'),
+    SlashCommandSpec('bughunter', 'Inspect the workspace for likely bugs', '[scope]', False),
+    SlashCommandSpec('commit', 'Generate a draft git commit summary', None, False),
+    SlashCommandSpec('pr', 'Draft a pull request summary', '[context]', False),
+    SlashCommandSpec('issue', 'Draft a GitHub issue summary', '[context]', False),
+    SlashCommandSpec('ultraplan', 'Generate a multi-step execution plan', '[task]', False),
+    SlashCommandSpec('teleport', 'Jump to a file by searching the workspace', '<symbol-or-path>', False),
+    SlashCommandSpec('debug-tool-call', 'Show the last tool execution', None, False),
+    SlashCommandSpec('export', 'Export the conversation to a file', '[file]'),
+    SlashCommandSpec('session', 'List or switch managed local sessions', '[list|switch <session-id>]', False),
+)
 
 
-PORTED_COMMANDS = load_command_snapshot()
+def parse_slash_command(text: str) -> tuple[str, str] | None:
+    trimmed = text.strip()
+    if not trimmed.startswith('/'):
+        return None
+    body = trimmed[1:]
+    name, _, remainder = body.partition(' ')
+    if not name:
+        return None
+    return name, remainder.strip()
 
 
-@lru_cache(maxsize=1)
-def built_in_command_names() -> frozenset[str]:
-    return frozenset(module.name for module in PORTED_COMMANDS)
-
-
-def build_command_backlog() -> PortingBacklog:
-    return PortingBacklog(title='Command surface', modules=list(PORTED_COMMANDS))
-
-
-def command_names() -> list[str]:
-    return [module.name for module in PORTED_COMMANDS]
-
-
-def get_command(name: str) -> PortingModule | None:
-    needle = name.lower()
-    for module in PORTED_COMMANDS:
-        if module.name.lower() == needle:
-            return module
-    return None
-
-
-def get_commands(cwd: str | None = None, include_plugin_commands: bool = True, include_skill_commands: bool = True) -> tuple[PortingModule, ...]:
-    commands = list(PORTED_COMMANDS)
-    if not include_plugin_commands:
-        commands = [module for module in commands if 'plugin' not in module.source_hint.lower()]
-    if not include_skill_commands:
-        commands = [module for module in commands if 'skills' not in module.source_hint.lower()]
-    return tuple(commands)
-
-
-def find_commands(query: str, limit: int = 20) -> list[PortingModule]:
-    needle = query.lower()
-    matches = [module for module in PORTED_COMMANDS if needle in module.name.lower() or needle in module.source_hint.lower()]
-    return matches[:limit]
-
-
-def execute_command(name: str, prompt: str = '') -> CommandExecution:
-    module = get_command(name)
-    if module is None:
-        return CommandExecution(name=name, source_hint='', prompt=prompt, handled=False, message=f'Unknown mirrored command: {name}')
-    action = f"Mirrored command '{module.name}' from {module.source_hint} would handle prompt {prompt!r}."
-    return CommandExecution(name=module.name, source_hint=module.source_hint, prompt=prompt, handled=True, message=action)
-
-
-def render_command_index(limit: int = 20, query: str | None = None) -> str:
-    modules = find_commands(query, limit) if query else list(PORTED_COMMANDS[:limit])
-    lines = [f'Command entries: {len(PORTED_COMMANDS)}', '']
-    if query:
-        lines.append(f'Filtered by: {query}')
-        lines.append('')
-    lines.extend(f'- {module.name} — {module.source_hint}' for module in modules)
+def render_slash_command_help() -> str:
+    lines = ['Slash commands', '']
+    for spec in SLASH_COMMAND_SPECS:
+        suffix = f' {spec.argument_hint}' if spec.argument_hint else ''
+        lines.append(f'/{spec.name}{suffix}'.rstrip())
+        lines.append(f'  {spec.summary}')
     return '\n'.join(lines)
+
+
+def slash_command_names() -> set[str]:
+    return {spec.name for spec in SLASH_COMMAND_SPECS}
